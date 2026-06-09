@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_context_model_parallel_rank,
@@ -30,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -463,11 +465,10 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
-    forward_batch: ForwardBatch,
+    local_start_pos: torch.Tensor,
+    local_num_tokens: torch.Tensor,
     is_partial: bool,
 ):
-    local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
-
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
@@ -498,7 +499,6 @@ def _dp_gather_via_all_reduce(
 def _dp_gather_via_all_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
-    forward_batch: ForwardBatch,
     is_partial: bool,
 ):
     if get_attention_tp_size() == 1:
@@ -515,20 +515,44 @@ def _dp_gather_via_all_gather(
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
+@register_custom_op(mutates_args=["global_tokens", "local_tokens"])
+@register_split_op()
+def dp_gather_core(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    local_start_pos: torch.Tensor,
+    local_num_tokens: torch.Tensor,
+    is_partial: bool,
+    is_max_len: bool,
+) -> None:
+    # Registered as a custom op + split op so the DP communication (collectives,
+    # storage-aliasing asserts, triton memcpy) stays opaque to torch.compile/Dynamo.
+    # This lets piecewise CUDA graph (PCG) work with DP attention: the collectives
+    # run eagerly between captured graph pieces instead of being traced (which
+    # previously failed on `local_tokens.untyped_storage() is not ...`).
+    if is_max_len:
+        _dp_gather_via_all_gather(global_tokens, local_tokens, is_partial)
+    else:
+        _dp_gather_via_all_reduce(
+            global_tokens, local_tokens, local_start_pos, local_num_tokens, is_partial
+        )
+
+
 def _dp_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if forward_batch.dp_padding_mode.is_max_len():
-        _dp_gather_via_all_gather(
-            global_tokens, local_tokens, forward_batch, is_partial
-        )
-    else:
-        _dp_gather_via_all_reduce(
-            global_tokens, local_tokens, forward_batch, is_partial
-        )
+    local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    dp_gather_core(
+        global_tokens,
+        local_tokens,
+        local_start_pos,
+        local_num_tokens,
+        is_partial,
+        forward_batch.dp_padding_mode.is_max_len(),
+    )
 
 
 def dp_gather_partial(
@@ -555,7 +579,19 @@ def dp_scatter(
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    dp_scatter_core(local_tokens, global_tokens, local_start_pos, local_num_tokens)
 
+
+@register_custom_op(mutates_args=["local_tokens"])
+@register_split_op()
+def dp_scatter_core(
+    local_tokens: torch.Tensor,  # output
+    global_tokens: torch.Tensor,  # input
+    local_start_pos: torch.Tensor,
+    local_num_tokens: torch.Tensor,
+) -> None:
+    # See `dp_gather_core`: opaque custom op / split op so the triton memcpy and
+    # storage-aliasing assert are not traced by torch.compile (PCG + DP attention).
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
