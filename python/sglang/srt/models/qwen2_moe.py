@@ -260,6 +260,20 @@ class Qwen2MoeMLP(nn.Module):
         return x
 
 
+def _shared_expert_accepts_fp8_tuple(shared_expert) -> bool:
+    """True when the shared expert's gate_up_proj can consume (fp8, scale).
+
+    Same test the attention/GDN projections use: a block-quantized (or mxfp8)
+    Fp8LinearMethod. Anything else must be handed the bf16 activations.
+    """
+    proj = getattr(shared_expert, "gate_up_proj", None)
+    quant_method = getattr(proj, "quant_method", None)
+    return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
+        getattr(quant_method, "block_quant", False)
+        or getattr(quant_method, "use_mxfp8", False)
+    )
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -513,11 +527,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def _forward_shared_experts(
-        self, hidden_states: torch.Tensor, apply_gate: bool = True
+        self,
+        hidden_states: torch.Tensor,
+        apply_gate: bool = True,
+        fp8_input=None,
     ):
+        """``fp8_input``, when given, is an ``(fp8, scale)`` pair for the shared
+        expert's FP8 ``gate_up_proj``, produced upstream by the fused
+        AR+RMSNorm+per-group-quant kernel; consuming it skips a redundant
+        activation quantization. The gates always stay on the bf16
+        ``hidden_states`` because they are unquantized projections.
+        """
         shared_output = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
+            shared_in = hidden_states if fp8_input is None else fp8_input
+            shared_output = self.shared_expert(shared_in)
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
@@ -673,6 +697,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        shared_fp8_input=None,
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
     ) -> torch.Tensor:
@@ -687,7 +712,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             with torch.cuda.stream(self.alt_stream):
                 shared_output = self._forward_shared_experts(
-                    hidden_states, apply_gate=False
+                    hidden_states, apply_gate=False, fp8_input=shared_fp8_input
                 )
                 if shared_output is not None:
                     shared_output = self._gate_shared_output_out_of_place(
@@ -699,7 +724,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         shared_output = (
             self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+                hidden_states.clone(),
+                apply_gate=not use_fused_gate,
+                # clone for the same stream-safety reason as the bf16 input
+                fp8_input=(
+                    None
+                    if shared_fp8_input is None
+                    else tuple(v.clone() for v in shared_fp8_input)
+                ),
             )
             if self.shared_expert is not None
             else None
@@ -738,6 +770,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         defer_finalize: bool = False,
     ) -> torch.Tensor:
+        # A fused AR+RMSNorm+per-group-quant epilogue upstream may hand us a
+        # (bf16, fp8, scale) triple instead of a tensor. Everything here runs on
+        # the bf16 view -- the router gate, the shared-expert gate and the MoE
+        # runner, which owns its own quantization -- except the shared expert's
+        # FP8 gate_up_proj, which consumes (fp8, scale) directly and thereby
+        # avoids re-quantizing activations that were already quantized.
+        shared_fp8_input = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hs_fp8, hs_scale = hidden_states
+            if _shared_expert_accepts_fp8_tuple(self.shared_expert):
+                shared_fp8_input = (hs_fp8, hs_scale)
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
@@ -770,12 +814,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states,
+                shared_fp8_input=shared_fp8_input,
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
             )
         else:
             shared_output = self._forward_shared_experts(
-                hidden_states, apply_gate=not use_fused_gate and not defer_finalize
+                hidden_states,
+                apply_gate=not use_fused_gate and not defer_finalize,
+                fp8_input=shared_fp8_input,
             )
             if defer_finalize and shared_output is not None:
                 shared_output = self._gate_shared_output_out_of_place(
