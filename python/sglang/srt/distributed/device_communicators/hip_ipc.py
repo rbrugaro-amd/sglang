@@ -37,7 +37,10 @@ _LAZY_ENABLE_PEER_ACCESS = 1
 
 
 class HipIpcMemHandle(ctypes.Structure):
-    _fields_ = [("reserved", ctypes.c_char * _HANDLE_BYTES)]
+    # c_ubyte, not c_char: a c_char array is treated as a NUL-terminated string
+    # by ctypes, so both reading and assigning would truncate the 64-byte handle
+    # at its first zero byte.
+    _fields_ = [("reserved", ctypes.c_ubyte * _HANDLE_BYTES)]
 
 
 class HipRTLibrary:
@@ -108,11 +111,15 @@ class HipRTLibrary:
             self.lib.hipIpcGetMemHandle(ctypes.byref(handle), ptr),
             "hipIpcGetMemHandle",
         )
-        return bytes(handle.reserved)
+        return ctypes.string_at(ctypes.addressof(handle), _HANDLE_BYTES)
 
     def open_ipc_handle(self, raw: bytes) -> int:
+        if len(raw) != _HANDLE_BYTES:
+            raise ValueError(
+                f"IPC handle must be {_HANDLE_BYTES} bytes, got {len(raw)}"
+            )
         handle = HipIpcMemHandle()
-        handle.reserved = raw
+        ctypes.memmove(ctypes.addressof(handle), raw, _HANDLE_BYTES)
         opened = ctypes.c_void_p()
         self._check(
             self.lib.hipIpcOpenMemHandle(
