@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -773,6 +774,30 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    def _gluon_tp_ar_norm_state(self, x: torch.Tensor):
+        """Lazily create and cache the rendezvous state on this group."""
+        state = getattr(self, "_gluon_tp_ar_state", None)
+        if state is not None:
+            return state or None  # False means permanently disabled
+        from sglang.srt.distributed.device_communicators import (
+            gluon_tp_ar_norm_quant as _g,
+        )
+
+        try:
+            state = _g.GluonTpArNormQuantState(
+                group=self.device_group,
+                device=x.device,
+                max_rows=max(_g.SUPPORTED_M),
+            )
+        except Exception as exc:
+            # Rendezvous is collective: all ranks must agree, so a failure
+            # disables the path permanently rather than desynchronising them.
+            logger.warning("Gluon TP AR+norm rendezvous failed, disabling: %s", exc)
+            self._gluon_tp_ar_state = False
+            return None
+        self._gluon_tp_ar_state = state
+        return state
+
     def fused_allreduce_rmsnorm(
         self,
         input_: torch.Tensor,
@@ -781,6 +806,34 @@ class GroupCoordinator:
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
+        # gfx950/TP4 fast path: a single Gluon kernel that does the all-reduce
+        # itself over HIP IPC. Hooked here rather than in the *_quant_per_group
+        # variant because this function is what BOTH prepare_attn and
+        # prepare_mlp funnel into, so one hook covers every norm site, and
+        # because it returns plain (bf16, bf16) -- no consumer has to learn a
+        # new data contract. is_supported() is strict and returns False for
+        # anything outside the validated envelope.
+        if not get_bool_env_var("SGLANG_DISABLE_GLUON_TP_AR_ALLSITES", "false"):
+            from sglang.srt.distributed.device_communicators import (
+                gluon_tp_ar_norm_quant as _g,
+            )
+
+            if _g.is_supported(
+                input_, residual_inp_, weight_, eps, self.world_size
+            ):
+                state = self._gluon_tp_ar_norm_state(input_)
+                if state is not None:
+                    _fp8, _scale, residual_out, normalized = (
+                        _g.fused_tp_ar_add_gemma_rmsnorm_group_fp8_quant(
+                            state, input_, residual_inp_, weight_
+                        )
+                    )
+                    # Return the plain (bf16, bf16) pair this API already
+                    # produces. The fp8/scale the kernel also computes are
+                    # dropped here; consuming them would require a data-contract
+                    # change in every downstream consumer.
+                    return normalized, residual_out
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
